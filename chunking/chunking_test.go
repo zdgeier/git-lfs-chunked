@@ -361,6 +361,54 @@ func TestBuildAndValidateManifest(t *testing.T) {
 	require.NoError(t, empty.Validate(empty.Oid, 0))
 }
 
+func TestChunkHashes(t *testing.T) {
+	// Reference values from b3sum / sha256sum.
+	assert.Equal(t, "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85", BLAKE3.Sum([]byte("abc")))
+	assert.Equal(t, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", SHA256.Sum([]byte("abc")))
+
+	for in, want := range map[string]ChunkHash{"": SHA256, "sha256": SHA256, "blake3": BLAKE3} {
+		got, err := ParseChunkHash(in)
+		require.NoError(t, err)
+		assert.Equal(t, want, got)
+	}
+	_, err := ParseChunkHash("md5")
+	assert.Error(t, err)
+	assert.Equal(t, "", SHA256.Wire(), "sha256 is omitted on the wire")
+	assert.Equal(t, "blake3", BLAKE3.Wire())
+}
+
+func TestBuildWithBlake3AndRehash(t *testing.T) {
+	c, err := NewFastCDC(Params{MinSize: 4096, AvgSize: 16384, MaxSize: 65535, Normalization: 1})
+	require.NoError(t, err)
+	content := randomBytes(t, 8, 200*1024)
+
+	sha, err := Build(bytes.NewReader(content), c)
+	require.NoError(t, err)
+	b3, err := BuildWithHash(bytes.NewReader(content), c, BLAKE3)
+	require.NoError(t, err)
+
+	assert.Equal(t, sha.Oid, b3.Oid, "the object ID is SHA-256 whatever the chunk hash")
+	assert.Equal(t, "blake3", b3.ChunkHash)
+	require.Equal(t, len(sha.Chunks), len(b3.Chunks))
+	for i, ch := range b3.Chunks {
+		assert.Equal(t, sha.Chunks[i].Offset, ch.Offset)
+		assert.Equal(t, BLAKE3.Sum(content[ch.Offset:ch.Offset+ch.Size]), ch.Oid)
+	}
+	require.NoError(t, b3.Validate(b3.Oid, b3.Size))
+
+	re, err := sha.Rehash(bytes.NewReader(content), BLAKE3)
+	require.NoError(t, err)
+	assert.Equal(t, b3, re)
+	back, err := re.Rehash(bytes.NewReader(content), SHA256)
+	require.NoError(t, err)
+	assert.Equal(t, sha, back)
+	assert.Equal(t, "", sha.ChunkHash, "Rehash must not modify its receiver")
+
+	bad := *b3
+	bad.ChunkHash = "md5"
+	assert.ErrorContains(t, bad.Validate(b3.Oid, b3.Size), "unsupported chunk hash")
+}
+
 func BenchmarkFastCDC(b *testing.B) {
 	content := make([]byte, 64<<20)
 	rand.New(rand.NewSource(1)).Read(content)

@@ -30,7 +30,21 @@ const (
 
 	// maxChunkSize bounds the memory a single chunk download may use.
 	maxChunkSize = 256 << 20
+
+	// chunkHashesHeader lists, on a manifest GET, the chunk hashes the
+	// client can verify. A server must not answer with a manifest in any
+	// other hash; without the header only sha256 is acceptable.
+	chunkHashesHeader = "LFS-Chunk-Hashes"
 )
+
+// supportedChunkHashes is chunking.SupportedChunkHashes as wire strings.
+func supportedChunkHashes() []string {
+	out := make([]string, len(chunking.SupportedChunkHashes))
+	for i, h := range chunking.SupportedChunkHashes {
+		out[i] = string(h)
+	}
+	return out
+}
 
 // Agent runs the custom transfer protocol on a pair of streams.
 type Agent struct {
@@ -45,6 +59,12 @@ type Agent struct {
 	index *chunkIndex
 	outMu sync.Mutex
 	out   *json.Encoder
+
+	// hashMu guards chunkHash: the chunk hash the server last asked for.
+	// An agent process serves one remote, so after the first renegotiation
+	// later proposals use the server's choice directly.
+	hashMu    sync.Mutex
+	chunkHash chunking.ChunkHash
 }
 
 // New builds an agent for the given store and chunking parameters.
@@ -57,12 +77,25 @@ func New(st Store, p chunking.Params) (*Agent, error) {
 		p = pc.Params()
 	}
 	return &Agent{
-		Store:   st,
-		Params:  p,
-		Chunker: c,
-		Client:  &http.Client{Timeout: 10 * time.Minute},
-		index:   newChunkIndex(st),
+		Store:     st,
+		Params:    p,
+		Chunker:   c,
+		Client:    &http.Client{Timeout: 10 * time.Minute},
+		index:     newChunkIndex(st),
+		chunkHash: chunking.SHA256,
 	}, nil
+}
+
+func (a *Agent) preferredHash() chunking.ChunkHash {
+	a.hashMu.Lock()
+	defer a.hashMu.Unlock()
+	return a.chunkHash
+}
+
+func (a *Agent) setPreferredHash(h chunking.ChunkHash) {
+	a.hashMu.Lock()
+	defer a.hashMu.Unlock()
+	a.chunkHash = h
 }
 
 func (a *Agent) trace(format string, args ...interface{}) {
@@ -202,7 +235,7 @@ func (a *Agent) upload(req *request) error {
 	}
 	defer f.Close()
 
-	m, err := chunking.Build(f, a.Chunker)
+	m, err := chunking.BuildWithHash(f, a.Chunker, a.preferredHash())
 	if err != nil {
 		return fmt.Errorf("chunking %s: %w", req.Oid, err)
 	}
@@ -210,14 +243,16 @@ func (a *Agent) upload(req *request) error {
 		return fmt.Errorf("local object %s is corrupt: content hashes to %s (%d bytes)", req.Oid, m.Oid, m.Size)
 	}
 	a.trace("%s split into %d chunks", req.Oid, len(m.Chunks))
-	saveManifest(a.Store, m)
 
-	// 1. Propose the manifest; learn which chunks the server lacks.
-	wire := toWire(m)
-	var plan wireManifest
-	if err := a.postJSON(req.Action, nil, wire, &plan); err != nil {
-		return fmt.Errorf("proposing manifest: %w", err)
+	// 1. Propose the manifest; learn which chunks the server lacks. The
+	// server may instead name a different chunk hash, in which case we
+	// re-describe the same chunks with it and propose once more.
+	wire, plan, err := a.propose(req, f, m)
+	if err != nil {
+		return err
 	}
+	m = wire.manifest()
+	saveManifest(a.Store, m)
 	a.trace("server is missing %d of %d chunks for %s", len(plan.Chunks), len(m.Chunks), req.Oid)
 
 	// 2. Send the missing chunks.
@@ -275,6 +310,36 @@ func (a *Agent) upload(req *request) error {
 	return nil
 }
 
+// propose POSTs m to the upload action and returns the manifest the server
+// accepted (possibly re-hashed) along with the server's plan.
+func (a *Agent) propose(req *request, f io.ReaderAt, m *chunking.Manifest) (*wireManifest, *wireManifest, error) {
+	for attempt := 0; ; attempt++ {
+		wire := toWire(m)
+		wire.ChunkHashes = supportedChunkHashes()
+		var plan wireManifest
+		if err := a.postJSON(req.Action, nil, wire, &plan); err != nil {
+			return nil, nil, fmt.Errorf("proposing manifest: %w", err)
+		}
+		have, _ := m.Hash()
+		want, err := chunking.ParseChunkHash(plan.ChunkHash)
+		if err != nil {
+			return nil, nil, fmt.Errorf("server chose an %s for %s", err, req.Oid)
+		}
+		if want == have {
+			wire.ChunkHashes = nil
+			return wire, &plan, nil
+		}
+		if attempt > 0 {
+			return nil, nil, fmt.Errorf("server rejected chunk hash %s for %s again, asking for %s", have, req.Oid, want)
+		}
+		a.trace("server wants %s chunk IDs for %s (proposed %s)", want, req.Oid, have)
+		if m, err = m.Rehash(f, want); err != nil {
+			return nil, nil, err
+		}
+		a.setPreferredHash(want)
+	}
+}
+
 // ---- download ----------------------------------------------------------
 
 func (a *Agent) download(req *request) (string, error) {
@@ -286,6 +351,7 @@ func (a *Agent) download(req *request) (string, error) {
 		return "", err
 	}
 	hreq.Header.Set("Accept", lfsMediaType)
+	hreq.Header.Set(chunkHashesHeader, strings.Join(supportedChunkHashes(), ", "))
 	res, err := a.do(hreq)
 	if err != nil {
 		return "", fmt.Errorf("fetching manifest: %w", err)
@@ -320,16 +386,17 @@ func (a *Agent) download(req *request) (string, error) {
 		if err := m.Validate(req.Oid, req.Size); err != nil {
 			return fail(err)
 		}
-		a.trace("%s has %d chunks", req.Oid, len(m.Chunks))
+		h, _ := m.Hash() // checked by Validate
+		a.trace("%s has %d %s chunks", req.Oid, len(m.Chunks), h)
 		var done int64
 		for _, c := range wire.Chunks {
 			if c.Size > maxChunkSize {
 				return fail(fmt.Errorf("chunk %s is too large (%d bytes)", c.Oid, c.Size))
 			}
-			data, ok := a.index.read(c.Oid, c.Size)
+			data, ok := a.index.read(h, c.Oid, c.Size)
 			if ok {
 				a.trace("reusing local chunk %s (%d bytes) for %s", c.Oid, c.Size, req.Oid)
-			} else if data, err = a.getChunk(req, c); err != nil {
+			} else if data, err = a.getChunk(req, h, c); err != nil {
 				return fail(err)
 			}
 			if _, err := out.Write(data); err != nil {
@@ -364,7 +431,7 @@ func (a *Agent) download(req *request) (string, error) {
 	return tmp, nil
 }
 
-func (a *Agent) getChunk(req *request, c *wireChunk) ([]byte, error) {
+func (a *Agent) getChunk(req *request, h chunking.ChunkHash, c *wireChunk) ([]byte, error) {
 	dl := c.Actions["download"]
 	if dl == nil {
 		return nil, fmt.Errorf("no download action for chunk %s", c.Oid)
@@ -387,7 +454,7 @@ func (a *Agent) getChunk(req *request, c *wireChunk) ([]byte, error) {
 	if n != c.Size {
 		return nil, fmt.Errorf("chunk %s: expected %d bytes, got %d", c.Oid, c.Size, n)
 	}
-	if actual := chunking.HashChunk(buf.Bytes()); actual != c.Oid {
+	if actual := h.Sum(buf.Bytes()); actual != c.Oid {
 		return nil, fmt.Errorf("chunk of %s: expected ID %s, got %s", req.Oid, c.Oid, actual)
 	}
 	return buf.Bytes(), nil

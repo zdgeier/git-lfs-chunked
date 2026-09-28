@@ -36,7 +36,7 @@ commands:
           remove that configuration
   transfer
           run the custom transfer protocol on stdin/stdout (git-lfs runs this)
-  chunk <file>
+  chunk [--hash sha256|blake3] <file>
           print the chunk manifest for a file using the configured algorithm
   version
 `)
@@ -198,8 +198,18 @@ func runUninstall(args []string) error {
 }
 
 func runChunk(args []string) error {
+	fs := flag.NewFlagSet("chunk", flag.ContinueOnError)
+	hashName := fs.String("hash", "sha256", "chunk ID hash (sha256 or blake3)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	args = fs.Args()
 	if len(args) != 1 {
-		return fmt.Errorf("usage: git-lfs-chunked chunk <file>")
+		return fmt.Errorf("usage: git-lfs-chunked chunk [--hash sha256|blake3] <file>")
+	}
+	h, err := chunking.ParseChunkHash(*hashName)
+	if err != nil {
+		return err
 	}
 	params := chunking.DefaultParams()
 	if env, err := gitenv.Discover(); err == nil {
@@ -216,7 +226,7 @@ func runChunk(args []string) error {
 		return err
 	}
 	defer f.Close()
-	m, err := chunking.Build(f, c)
+	m, err := chunking.BuildWithHash(f, c, h)
 	if err != nil {
 		return err
 	}

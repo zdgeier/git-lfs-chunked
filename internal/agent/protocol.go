@@ -44,11 +44,17 @@ type response struct {
 // chunking.Manifest with per-chunk and per-object actions attached.
 
 type wireManifest struct {
-	Oid       string             `json:"oid"`
-	Size      int64              `json:"size"`
-	Algorithm *chunking.Params   `json:"algorithm,omitempty"`
-	Chunks    []*wireChunk       `json:"chunks"`
-	Actions   map[string]*action `json:"actions,omitempty"`
+	Oid       string           `json:"oid"`
+	Size      int64            `json:"size"`
+	Algorithm *chunking.Params `json:"algorithm,omitempty"`
+	// ChunkHash names the hash of the chunk IDs in this message; empty
+	// means sha256. In a propose response it is the hash the server wants.
+	ChunkHash string `json:"chunk_hash,omitempty"`
+	// ChunkHashes, sent only in proposals, lists the chunk hashes the
+	// client can switch to.
+	ChunkHashes []string           `json:"chunk_hashes,omitempty"`
+	Chunks      []*wireChunk       `json:"chunks"`
+	Actions     map[string]*action `json:"actions,omitempty"`
 }
 
 type wireChunk struct {
@@ -59,7 +65,7 @@ type wireChunk struct {
 }
 
 func toWire(m *chunking.Manifest) *wireManifest {
-	w := &wireManifest{Oid: m.Oid, Size: m.Size, Algorithm: m.Algorithm, Chunks: make([]*wireChunk, 0, len(m.Chunks))}
+	w := &wireManifest{Oid: m.Oid, Size: m.Size, Algorithm: m.Algorithm, ChunkHash: m.ChunkHash, Chunks: make([]*wireChunk, 0, len(m.Chunks))}
 	for _, c := range m.Chunks {
 		w.Chunks = append(w.Chunks, &wireChunk{Oid: c.Oid, Size: c.Size, Offset: c.Offset})
 	}
@@ -67,7 +73,7 @@ func toWire(m *chunking.Manifest) *wireManifest {
 }
 
 func (w *wireManifest) manifest() *chunking.Manifest {
-	m := &chunking.Manifest{Oid: w.Oid, Size: w.Size, Algorithm: w.Algorithm, Chunks: make([]chunking.ManifestChunk, 0, len(w.Chunks))}
+	m := &chunking.Manifest{Oid: w.Oid, Size: w.Size, Algorithm: w.Algorithm, ChunkHash: w.ChunkHash, Chunks: make([]chunking.ManifestChunk, 0, len(w.Chunks))}
 	for _, c := range w.Chunks {
 		m.Chunks = append(m.Chunks, chunking.ManifestChunk{Oid: c.Oid, Size: c.Size, Offset: c.Offset})
 	}

@@ -61,8 +61,8 @@ Sizes accept `k`, `m`, `g` suffixes. `git-lfs-chunked install --avg-size 512k`
 etc. sets them for you. Changing parameters only changes which chunks match
 earlier uploads; it never affects correctness.
 
-`git-lfs-chunked chunk <file>` prints the manifest a file would produce —
-handy for checking how a change affects chunk boundaries.
+`git-lfs-chunked chunk [--hash blake3] <file>` prints the manifest a file
+would produce — handy for checking how a change affects chunk boundaries.
 
 ## How it works
 
@@ -70,7 +70,8 @@ The `chunking` package implements FastCDC (Xia et al., 2016; the 2020
 refinement with gear hashing and normalized chunking). Its boundaries are
 byte-identical to the Rust [`fastcdc`](https://crates.io/crates/fastcdc)
 crate's `v2020` variant, and chunk IDs are hex SHA-256 — the same function
-LFS uses for object IDs. It streams, with memory bounded by the maximum
+LFS uses for object IDs — unless the server negotiates BLAKE3 (below). It
+streams, with memory bounded by the maximum
 chunk size, at roughly 2.8 GB/s.
 
 For an upload the agent POSTs a manifest (`{oid, size, chunks:[{oid, size,
@@ -83,6 +84,41 @@ again before storing it, as it does for every custom transfer.
 
 Authentication is whatever the server puts in the action's `header` (for
 example a bearer token); it is forwarded to every chunk request.
+
+## Chunk hash negotiation
+
+Object IDs are always SHA-256 (they are what LFS pointers contain), but
+chunk IDs may use another hash, so that a server can address chunks with
+whatever its store already uses — for example a BLAKE3 content-addressed
+store, where FastCDC with the default parameters produces exactly the
+chunks the store already holds. Supported: `sha256` (the default) and
+`blake3` (unkeyed, 256-bit, hex). The server chooses; a peer that knows
+nothing of this extension only ever sees SHA-256.
+
+Manifests gain an optional `chunk_hash` field naming the hash of their chunk
+IDs; absent means `sha256`.
+
+* **Upload.** The proposal carries `chunk_hash` (absent at first) and
+  `chunk_hashes`, the list the client can switch to:
+
+  ```json
+  { "oid": "…", "size": 123, "chunk_hashes": ["sha256", "blake3"], "chunks": [...] }
+  ```
+
+  A server that wants a different hash answers with `"chunk_hash":
+  "blake3"` and an empty `chunks` list, and no `commit` action. The client
+  re-describes the same chunks with that hash (boundaries are unchanged) and
+  proposes again with `"chunk_hash": "blake3"`; the chunk PUTs and the
+  commit then use BLAKE3 IDs. The client renegotiates at most once per
+  object, fails on a hash it does not support, and remembers the server's
+  choice for the rest of the transfer so later objects skip the extra round
+  trip. A response without `chunk_hash` means `sha256`, so servers that
+  predate the extension are unaffected.
+* **Download.** The manifest GET sends `LFS-Chunk-Hashes: sha256, blake3`.
+  The server may answer with a manifest whose `chunk_hash` is any listed
+  hash; the client verifies each chunk with it. A request without the header
+  (older clients) must get a SHA-256 manifest or the whole object as raw
+  bytes.
 
 ## Limitations
 

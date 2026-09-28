@@ -32,6 +32,25 @@ type testServer struct {
 	corrupt    string
 	// requireAuth rejects requests without this Authorization header.
 	requireAuth string
+	// hash is the chunk hash the server keys chunks by ("" = sha256).
+	// Chunks, manifests and the chunk PUT check all use it.
+	hash chunking.ChunkHash
+	// answerHash, if set, is sent as chunk_hash in propose responses
+	// instead of hash (to simulate misbehaving servers).
+	answerHash string
+	// flip answers every proposal with the other supported hash.
+	flip      bool
+	proposals int
+	// lastAccept records the LFS-Chunk-Hashes header of the last
+	// manifest GET.
+	lastAccept string
+}
+
+func (s *testServer) chunkHash() chunking.ChunkHash {
+	if s.hash == "" {
+		return chunking.SHA256
+	}
+	return s.hash
 }
 
 func newTestServer(t *testing.T) *testServer {
@@ -61,7 +80,27 @@ func (s *testServer) handle(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 422)
 			return
 		}
+		s.proposals++
 		resp := wireManifest{Oid: m.Oid, Size: m.Size, Chunks: []*wireChunk{}}
+		if s.answerHash != "" {
+			resp.ChunkHash = s.answerHash
+			writeJSON(resp)
+			return
+		}
+		if s.flip {
+			if m.ChunkHash == "" {
+				resp.ChunkHash = "blake3"
+			}
+			writeJSON(resp)
+			return
+		}
+		// Proposed in another hash: name ours and list nothing.
+		if h, _ := chunking.ParseChunkHash(m.ChunkHash); h != s.chunkHash() {
+			resp.ChunkHash = s.chunkHash().Wire()
+			writeJSON(resp)
+			return
+		}
+		resp.ChunkHash = m.ChunkHash
 		for _, c := range m.Chunks {
 			if _, ok := s.chunks[c.Oid]; ok {
 				continue
@@ -73,7 +112,7 @@ func (s *testServer) handle(w http.ResponseWriter, r *http.Request) {
 		writeJSON(resp)
 	case "chunks PUT":
 		by, _ := io.ReadAll(r.Body)
-		if chunking.HashChunk(by) != oid {
+		if s.chunkHash().Sum(by) != oid {
 			http.Error(w, "bad chunk hash", 422)
 			return
 		}
@@ -106,13 +145,15 @@ func (s *testServer) handle(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		if s.serveWhole {
+		s.lastAccept = r.Header.Get(chunkHashesHeader)
+		// A client that cannot verify our chunk IDs gets the whole object.
+		if s.serveWhole || (s.chunkHash() != chunking.SHA256 && !strings.Contains(s.lastAccept, string(s.chunkHash()))) {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Write(content)
 			return
 		}
 		m := s.manifests[oid]
-		resp := wireManifest{Oid: m.Oid, Size: m.Size, Chunks: []*wireChunk{}}
+		resp := wireManifest{Oid: m.Oid, Size: m.Size, ChunkHash: m.ChunkHash, Chunks: []*wireChunk{}}
 		for _, c := range m.Chunks {
 			resp.Chunks = append(resp.Chunks, &wireChunk{Oid: c.Oid, Size: c.Size, Offset: c.Offset,
 				Actions: map[string]*action{"download": {Href: s.URL + "/chunks/" + c.Oid}}})
@@ -381,6 +422,79 @@ func TestFixedAlgorithm(t *testing.T) {
 	puts, _ := s.counters()
 	assert.Equal(t, 13, puts)
 	assert.Equal(t, "fixed", s.manifests[oid].Algorithm.Algorithm)
+}
+
+func TestBlake3Negotiation(t *testing.T) {
+	s := newTestServer(t)
+	s.hash = chunking.BLAKE3
+	up := newClient(t, small)
+
+	v1 := randomFile(t, "v1.bin", 9, 512*1024)
+	oid1, size1, res, _ := up.upload(s, v1, nil)
+	require.Nil(t, res.Error, "%+v", res.Error)
+	assert.Equal(t, 2, s.proposals, "sha256 proposal, then a blake3 one")
+	m := s.manifests[oid1]
+	assert.Equal(t, "blake3", m.ChunkHash)
+	v1by, _ := os.ReadFile(v1)
+	for _, c := range m.Chunks {
+		assert.Equal(t, chunking.BLAKE3.Sum(v1by[c.Offset:c.Offset+c.Size]), c.Oid)
+	}
+	puts1, _ := s.counters()
+
+	// The same agent now proposes blake3 straight away, and dedup works.
+	v2by := append(append([]byte{}, v1by...), []byte("appended")...)
+	v2 := filepath.Join(t.TempDir(), "v2.bin")
+	require.NoError(t, os.WriteFile(v2, v2by, 0644))
+	oid2, size2, res, _ := up.upload(s, v2, nil)
+	require.Nil(t, res.Error, "%+v", res.Error)
+	assert.Equal(t, 3, s.proposals)
+	puts2, _ := s.counters()
+	assert.LessOrEqual(t, puts2-puts1, 2)
+
+	// A fresh client verifies blake3 chunks and reuses them locally.
+	down := newClient(t, nil)
+	res, _ = down.download(s, oid1, size1, nil)
+	require.Nil(t, res.Error, "%+v", res.Error)
+	assert.Equal(t, "sha256, blake3", s.lastAccept)
+	_, gets1 := s.counters()
+	res, _ = down.download(s, oid2, size2, nil)
+	require.Nil(t, res.Error, "%+v", res.Error)
+	got, _ := os.ReadFile(down.st.ObjectPath(oid2))
+	assert.True(t, bytes.Equal(v2by, got))
+	_, gets2 := s.counters()
+	assert.LessOrEqual(t, gets2-gets1, 2)
+
+	// A corrupt blake3 chunk is caught.
+	s.mu.Lock()
+	s.corrupt = m.Chunks[1].Oid
+	s.mu.Unlock()
+	res, _ = newClient(t, nil).download(s, oid1, size1, nil)
+	require.NotNil(t, res.Error)
+	assert.Contains(t, res.Error.Message, "expected ID")
+}
+
+func TestUnsupportedChunkHashIsRejected(t *testing.T) {
+	s := newTestServer(t)
+	s.answerHash = "md5"
+	up := newClient(t, small)
+	p := randomFile(t, "a.bin", 10, 50*1024)
+	_, _, res, _ := up.upload(s, p, nil)
+	require.NotNil(t, res.Error)
+	assert.Contains(t, res.Error.Message, `unsupported chunk hash "md5"`)
+	assert.Equal(t, 1, s.proposals)
+}
+
+func TestChunkHashRenegotiatesOnlyOnce(t *testing.T) {
+	s := newTestServer(t)
+	s.flip = true
+	up := newClient(t, small)
+	p := randomFile(t, "a.bin", 11, 50*1024)
+	_, _, res, _ := up.upload(s, p, nil)
+	require.NotNil(t, res.Error)
+	assert.Contains(t, res.Error.Message, "again")
+	assert.Equal(t, 2, s.proposals)
+	puts, _ := s.counters()
+	assert.Equal(t, 0, puts)
 }
 
 func TestBadParams(t *testing.T) {

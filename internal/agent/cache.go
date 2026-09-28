@@ -41,7 +41,8 @@ func saveManifest(st Store, m *chunking.Manifest) {
 }
 
 // chunkIndex maps chunk IDs to locations inside local LFS objects, built
-// from the cached manifests.
+// from the cached manifests. Keys carry the chunk hash ("blake3:<id>") since
+// a cache may hold manifests from servers that chose different hashes.
 type chunkIndex struct {
 	st   Store
 	root string
@@ -49,6 +50,8 @@ type chunkIndex struct {
 	mu   sync.Mutex
 	locs map[string]chunkLoc
 }
+
+func indexKey(h chunking.ChunkHash, oid string) string { return string(h) + ":" + oid }
 
 type chunkLoc struct {
 	oid    string
@@ -90,21 +93,27 @@ func (ix *chunkIndex) load() {
 }
 
 func (ix *chunkIndex) add(m *chunking.Manifest) {
+	h, err := m.Hash()
+	if err != nil {
+		return
+	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	for _, c := range m.Chunks {
-		if _, ok := ix.locs[c.Oid]; !ok {
-			ix.locs[c.Oid] = chunkLoc{oid: m.Oid, offset: c.Offset, size: c.Size}
+		k := indexKey(h, c.Oid)
+		if _, ok := ix.locs[k]; !ok {
+			ix.locs[k] = chunkLoc{oid: m.Oid, offset: c.Offset, size: c.Size}
 		}
 	}
 }
 
-// read returns the bytes of chunk oid if a local object contains it and
-// its content still hashes to oid.
-func (ix *chunkIndex) read(oid string, size int64) ([]byte, bool) {
+// read returns the bytes of chunk oid (an ID under h) if a local object
+// contains it and its content still hashes to oid.
+func (ix *chunkIndex) read(h chunking.ChunkHash, oid string, size int64) ([]byte, bool) {
 	ix.load()
+	k := indexKey(h, oid)
 	ix.mu.Lock()
-	loc, ok := ix.locs[oid]
+	loc, ok := ix.locs[k]
 	ix.mu.Unlock()
 	if !ok || loc.size != size {
 		return nil, false
@@ -118,9 +127,9 @@ func (ix *chunkIndex) read(oid string, size int64) ([]byte, bool) {
 	if _, err := f.ReadAt(data, loc.offset); err != nil {
 		return nil, false
 	}
-	if chunking.HashChunk(data) != oid {
+	if h.Sum(data) != oid {
 		ix.mu.Lock()
-		delete(ix.locs, oid)
+		delete(ix.locs, k)
 		ix.mu.Unlock()
 		return nil, false
 	}
